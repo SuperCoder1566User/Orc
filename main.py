@@ -1,217 +1,210 @@
-from flask import Flask, render_template_string, request, redirect, session, url_for, send_from_directory
+from flask import Flask, request, redirect, render_template_string, make_response, send_file
+import os
+import time
 from datetime import datetime, timedelta
-import os, json, uuid, time
-from werkzeug.utils import secure_filename
 from collections import defaultdict
 
 app = Flask(__name__)
-app.secret_key = 'super_secret_key'
 
-# ========== CONFIG ==========
-UPLOAD_FOLDER = 'uploads'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-ALLOWED_EXTENSIONS = {'wav', 'mp3', 'ogg'}
-MESSAGE_TIMEOUT = 36000  # 10 hours
-admin_secret = "sharktooth"
-
-# ========== STATE ==========
-chat_messages = []
+# Storage
+messages = []
+users = {}
 banned_ips = set()
+ban_messages = {}
 username_ip_map = {}
-dark_mode = True
-shutdown = False
 broadcasts = []
-custom_ban_messages = {}
-admin_username = "Admin"
-play_sounds = []
+admin_only_mode = False
+dark_mode = False
 
-# ========== UTILS ==========
+# Settings
+CHAT_EXPIRY_SECONDS = 36000  # 10 hours
 
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+html_base = '''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>{{ title }}</title>
+    <style>
+        body {
+            background-color: {% if dark %}#121212{% else %}#ffffff{% endif %};
+            color: {% if dark %}#ffffff{% else %}#000000{% endif %};
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            padding: 20px;
+        }
+        input[type="text"], input[type="file"] {
+            border-radius: 10px;
+            padding: 8px;
+            margin: 5px;
+            border: 1px solid #ccc;
+        }
+        button {
+            border-radius: 10px;
+            padding: 10px;
+            margin: 5px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        .message {
+            margin-bottom: 10px;
+        }
+        .broadcast {
+            font-size: 18px;
+            font-weight: bold;
+            background-color: yellow;
+            color: black;
+            padding: 5px;
+            border-radius: 5px;
+        }
+        .admin {
+            font-weight: bold;
+            font-size: 18px;
+        }
+        .red {
+            color: red;
+        }
+    </style>
+</head>
+<body>
+<h1>{{ title }}</h1>
+{{ body }}
+</body>
+</html>
+'''
 
-def is_admin():
-    return session.get("is_admin", False)
+def current_time():
+    return time.time()
 
-def get_ip():
-    return request.headers.get('X-Forwarded-For', request.remote_addr)
+def cleanup_expired():
+    cutoff = current_time() - CHAT_EXPIRY_SECONDS
+    global messages
+    messages = [m for m in messages if m['timestamp'] > cutoff]
 
-# ========== ROUTES ==========
+def is_banned(ip):
+    return ip in banned_ips
 
 @app.route('/')
-def home():
+def index():
     return redirect('/lander')
 
 @app.route('/lander', methods=['GET', 'POST'])
 def lander():
-    ip = get_ip()
-    if shutdown and not is_admin():
-        return "🔒 Site is currently shut down."
-
+    ip = request.remote_addr
     if request.method == 'POST':
         phrase = request.form.get('phrase')
         if phrase == 'TheFans':
             return redirect('/usrname')
-        elif phrase == admin_secret:
-            session["is_admin"] = True
+        elif phrase == 'sharktooth':
             return redirect('/admin')
     return render_template_string(html_base, title="Enter Secret Phrase", dark=dark_mode, body="""
-        <form method="POST" class="flex flex-col gap-4 items-center">
-            <input name="phrase" placeholder="Secret Phrase" class="rounded-xl p-2 w-60 text-black">
-            <button class="rounded-xl bg-blue-500 px-4 py-2 text-white hover:bg-blue-700">Enter</button>
+        <form method="POST">
+            <input type="text" name="phrase" placeholder="Secret Phrase">
+            <button type="submit">Enter</button>
         </form>
     """)
 
 @app.route('/usrname', methods=['GET', 'POST'])
 def usrname():
-    if shutdown and not is_admin():
-        return "🔒 Site is currently shut down."
-
     if request.method == 'POST':
-        username = request.form.get('username')
-        if username:
-            session['username'] = username
-            username_ip_map[username] = get_ip()
-            return redirect('/FriendGroup')
+        uname = request.form.get('uname')
+        resp = make_response(redirect('/FriendGroup'))
+        resp.set_cookie('username', uname)
+        username_ip_map[uname] = request.remote_addr
+        return resp
     return render_template_string(html_base, title="Choose Username", dark=dark_mode, body="""
-        <form method="POST" class="flex flex-col gap-4 items-center">
-            <input name="username" placeholder="Enter Username" class="rounded-xl p-2 w-60 text-black">
-            <button class="rounded-xl bg-green-500 px-4 py-2 text-white hover:bg-green-700">Start Chatting</button>
+        <form method="POST">
+            <input type="text" name="uname" placeholder="Username">
+            <button type="submit">Join</button>
         </form>
     """)
 
 @app.route('/FriendGroup', methods=['GET', 'POST'])
 def chat():
-    ip = get_ip()
-    username = session.get('username')
+    ip = request.remote_addr
+    if admin_only_mode and ip not in banned_ips and request.cookies.get('username') != 'admin':
+        return redirect('/lander')
+    if is_banned(ip):
+        msg = ban_messages.get(ip, "You are banned.")
+        return render_template_string(html_base, title="Banned", dark=dark_mode, body=f"<p>{msg}</p>")
 
-    if not username or (ip in banned_ips and not is_admin()):
-        return "⛔ Access Denied."
+    uname = request.cookies.get('username')
+    if not uname:
+        return redirect('/usrname')
 
     if request.method == 'POST':
-        text = request.form.get('message')
-        now = datetime.utcnow()
-        if text:
-            chat_messages.append({
-                'user': username,
-                'text': text,
-                'timestamp': now.timestamp()
-            })
-
-    now = datetime.utcnow().timestamp()
-    messages = [m for m in chat_messages if now - m['timestamp'] < MESSAGE_TIMEOUT]
-    display_messages = "\n".join([
-        f"<b style='font-size: {'1.2em' if m['user'] == admin_username else '1em'};'>{m['user']}</b>: {m['text']}"
-        for m in messages
-    ])
-    display_broadcasts = "<br>".join([f"<div class='text-yellow-400 font-bold text-lg'>{b}</div>" for b in broadcasts])
-
-    audio_players = "\n".join([f"<audio autoplay src='/uploads/{f}'></audio>" for f in play_sounds])
-
-    return render_template_string(html_base, title="Group Chat", dark=dark_mode, body=f"""
-        {display_broadcasts}
-        {audio_players}
-        <div class="mb-4">{display_messages}</div>
-        <form method="POST" class="flex gap-4">
-            <input name="message" class="rounded-xl p-2 w-full text-black">
-            <button class="rounded-xl bg-purple-500 text-white px-4 py-2">Send</button>
+        content = request.form.get('msg')
+        messages.append({'user': uname, 'msg': content, 'timestamp': current_time(), 'admin': uname=='admin'})
+    cleanup_expired()
+    all_msgs = '<br>'.join(
+        [f"<div class='message {'admin' if m['admin'] else ''}'><b class='{'admin' if m['admin'] else ''}'>{m['user']}:</b> {m['msg']}</div>" for m in messages] +
+        [f"<div class='broadcast'>{b}</div>" for b in broadcasts]
+    )
+    return render_template_string(html_base, title="Chat Room", dark=dark_mode, body=f"""
+        <form method="POST">
+            <input type="text" name="msg" placeholder="Your Message">
+            <button type="submit">Send</button>
         </form>
+        <hr>
+        {all_msgs}
     """)
 
 @app.route('/admin', methods=['GET', 'POST'])
 def admin():
-    if not is_admin():
-        return "⛔ Forbidden"
-
-    message = ""
-
+    global admin_only_mode, dark_mode
+    ip = request.remote_addr
     if request.method == 'POST':
         action = request.form.get('action')
-        value = request.form.get('value')
+        uname = request.form.get('target')
+        msg = request.form.get('broadcast')
+        reason = request.form.get('reason')
 
         if action == 'ColorChat':
-            session['username'] = f"<span style='color:red;font-weight:bold'>{value}</span>"
-            return redirect('/FriendGroup')
-        elif action == 'BanIP':
-            banned_ips.add(username_ip_map.get(value, value))
-        elif action == 'UnbanIP':
-            banned_ips.discard(username_ip_map.get(value, value))
+            resp = make_response(redirect('/FriendGroup'))
+            resp.set_cookie('username', uname)
+            messages.append({'user': uname, 'msg': 'joined as admin.', 'timestamp': current_time(), 'admin': True})
+            return resp
+        elif action == 'Ban':
+            ip_to_ban = username_ip_map.get(uname)
+            if ip_to_ban:
+                banned_ips.add(ip_to_ban)
+                ban_messages[ip_to_ban] = reason or "Banned."
+        elif action == 'Unban':
+            ip_to_unban = username_ip_map.get(uname)
+            if ip_to_unban:
+                banned_ips.discard(ip_to_unban)
+                ban_messages.pop(ip_to_unban, None)
         elif action == 'ClearChat':
-            chat_messages.clear()
+            messages.clear()
         elif action == 'Shutdown':
-            global shutdown
-            shutdown = not shutdown
+            admin_only_mode = not admin_only_mode
         elif action == 'Toggle':
-            global dark_mode
             dark_mode = not dark_mode
-        elif action == 'Broadcast':
-            broadcasts.append(value)
-        elif action == 'CustomBan':
-            custom_ban_messages[username_ip_map.get(value, value)] = request.form.get('banmsg')
-        elif action == 'PlaySound':
-            file = request.files['soundfile']
-            if file and allowed_file(file.filename):
-                filename = secure_filename(file.filename)
-                path = os.path.join(UPLOAD_FOLDER, filename)
-                file.save(path)
-                play_sounds.append(filename)
-                message = f"✅ Uploaded {filename}"
+        elif action == 'Broadcast' and msg:
+            broadcasts.append(msg)
 
-    users_html = "".join([f"<li>{u} — {ip}</li>" for u, ip in username_ip_map.items()])
-
+    user_list = '<br>'.join(f"{u}: {ip}" for u, ip in username_ip_map.items())
     return render_template_string(html_base, title="Admin Panel", dark=dark_mode, body=f"""
-        <div class="grid gap-4">
-            <form method="POST" class="flex gap-2">
-                <input name="value" placeholder="Red Username" class="rounded-xl p-2 text-black">
-                <button name="action" value="ColorChat" class="rounded-xl bg-red-500 text-white px-4">ColorChat</button>
-            </form>
-            <form method="POST" class="flex gap-2">
-                <input name="value" placeholder="User/IP" class="rounded-xl p-2 text-black">
-                <button name="action" value="BanIP" class="rounded-xl bg-black text-white px-4">Ban hammer</button>
-                <button name="action" value="UnbanIP" class="rounded-xl bg-green-500 text-white px-4">Unbanner</button>
-            </form>
-            <form method="POST" class="flex gap-2">
-                <button name="action" value="ClearChat" class="rounded-xl bg-yellow-400 text-black px-4">ClearChat</button>
-                <button name="action" value="Shutdown" class="rounded-xl bg-gray-600 text-white px-4">Shutdown</button>
-                <button name="action" value="Toggle" class="rounded-xl bg-purple-600 text-white px-4">Toggle Mode</button>
-            </form>
-            <form method="POST" class="flex gap-2">
-                <input name="value" placeholder="Broadcast Message" class="rounded-xl p-2 text-black w-full">
-                <button name="action" value="Broadcast" class="rounded-xl bg-blue-700 text-white px-4">Broadcast</button>
-            </form>
-            <form method="POST" enctype="multipart/form-data" class="flex gap-2">
-                <input type="file" name="soundfile" class="rounded-xl text-white">
-                <button name="action" value="PlaySound" class="rounded-xl bg-indigo-600 text-white px-4">PlaySound</button>
-            </form>
-            <div class="mt-6 text-white">
-                <b>Users & IPs:</b>
-                <ul>{users_html}</ul>
-            </div>
-            <div class="text-green-400">{message}</div>
-        </div>
+        <form method="POST">
+            <input type="text" name="target" placeholder="Username">
+            <button name="action" value="ColorChat">ColorChat</button><br>
+            <input type="text" name="reason" placeholder="Ban Reason">
+            <button name="action" value="Ban">Ban hammer</button>
+            <button name="action" value="Unban">Unbanner</button><br>
+            <button name="action" value="ClearChat">ClearChat</button>
+            <button name="action" value="Shutdown">Shutdown</button>
+            <button name="action" value="Toggle">Toggle</button><br>
+            <input type="text" name="broadcast" placeholder="Broadcast Message">
+            <button name="action" value="Broadcast">Broadcast</button>
+        </form>
+        <hr>
+        <h3>Username-IP Map:</h3>
+        {user_list}
     """)
 
-@app.route('/uploads/<path:filename>')
-def uploaded_file(filename):
-    return send_from_directory(UPLOAD_FOLDER, filename)
-
-# ========== HTML TEMPLATE ==========
-html_base = """
-<!DOCTYPE html>
-<html class="{{ 'dark' if dark else '' }}">
-<head>
-    <title>{{ title }}</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-900 text-white p-10 font-sans">
-    <div class="max-w-xl mx-auto">
-        <h1 class="text-3xl font-bold mb-6">{{ title }}</h1>
-        {{ body|safe }}
-    </div>
-</body>
-</html>
-"""
-
-# ========== RUN ==========
-if __name__ == "__main__":
+if __name__ == '__main__':
     app.run(debug=True, port=5050)
