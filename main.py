@@ -1,114 +1,204 @@
-from flask import Flask, render_template_string, request, redirect, session, send_from_directory
+from flask import Flask, render_template_string, request, redirect, url_for, session, send_from_directory
 from flask_socketio import SocketIO, emit
+from werkzeug.utils import secure_filename
 from datetime import datetime, timedelta
 import os
 
 app = Flask(__name__)
-app.secret_key = 'secret'
+app.config['SECRET_KEY'] = 'secret!'
 socketio = SocketIO(app)
-chat_history = []
+UPLOAD_FOLDER = 'static/sounds'
+ALLOWED_EXTENSIONS = {'wav', 'mp3', 'ogg'}
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+chat_log = []  # Format: {'username':..., 'text':..., 'color':..., 'timestamp':...}
 banned_ips = set()
-shutdown_mode = False
+shutdown = False
 dark_mode = True
 
+def is_allowed(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+# Templates
+lander_page = '''
+<!DOCTYPE html>
+<html><head><title>Lander</title></head>
+<body style="background:black; color:white; font-family:sans-serif;">
+<h2>Enter Secret Phrase</h2>
+<form method="POST"><input name="phrase" autofocus style="padding:8px;"><button style="padding:8px;">Enter</button></form>
+</body></html>
+'''
+
+username_page = '''
+<!DOCTYPE html>
+<html><head><title>Username</title></head>
+<body style="background:black; color:white; font-family:sans-serif;">
+<h2>Choose a Username</h2>
+<form method="POST"><input name="username" autofocus style="padding:8px;"><button style="padding:8px;">Enter</button></form>
+</body></html>
+'''
+
+chat_page = '''
+<!DOCTYPE html>
+<html>
+<head>
+    <title>FriendGroup Chat</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+    <style>
+        body { background-color: #121212; color: white; font-family: sans-serif; padding: 20px; }
+        input, button {
+            padding: 10px; border: none; border-radius: 10px; margin: 5px;
+        }
+        input { width: 60%; background: #222; color: white; }
+        button { background: #333; color: white; cursor: pointer; }
+        button:hover { background: #555; }
+        #chat { max-height: 70vh; overflow-y: auto; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <div id="chat"></div>
+    <form id="msgform">
+        <input id="msg" autocomplete="off" placeholder="Type a message...">
+        <button>Send</button>
+    </form>
+    <script>
+        var socket = io();
+        var myName = "{{username}}";
+        socket.on('connect', () => {
+            socket.emit('join', myName);
+        });
+        socket.on('message', data => {
+            const p = document.createElement("p");
+            p.style.color = data.color || "white";
+            p.innerText = `${data.username}: ${data.text}`;
+            document.getElementById("chat").appendChild(p);
+        });
+        socket.on('play_audio', url => {
+            const audio = new Audio(url);
+            audio.play();
+        });
+        document.getElementById("msgform").onsubmit = e => {
+            e.preventDefault();
+            const msg = document.getElementById("msg").value;
+            socket.emit("chat", {username: myName, text: msg});
+            document.getElementById("msg").value = "";
+        };
+    </script>
+</body>
+</html>
+'''
+
+admin_page = '''
+<!DOCTYPE html>
+<html>
+<head><title>Admin Panel</title></head>
+<body style="background:black; color:white; font-family:sans-serif; padding:20px;">
+<h1>Admin Panel</h1>
+<ul>
+  <li><a href="/FriendGroup?color=red">ColorChat (Red)</a></li>
+  <li><form method="POST" action="/admin/ban"><input name="ip"><button>Ban</button></form></li>
+  <li><form method="POST" action="/admin/unban"><input name="ip"><button>Unban</button></form></li>
+  <li><form method="POST" action="/admin/clear"><button>Clear Chat</button></form></li>
+  <li><form method="POST" action="/admin/shutdown"><button>Toggle Shutdown</button></form></li>
+  <li><form method="POST" action="/admin/toggle"><button>Toggle Dark/Light Mode</button></form></li>
+  <li>
+    <form method="POST" action="/admin/sound" enctype="multipart/form-data">
+      <input type="file" name="sound">
+      <button>PlaySound</button>
+    </form>
+  </li>
+</ul>
+</body>
+</html>
+'''
+
 @app.route('/')
-def home():
-    return redirect('/lander')
+def root(): return redirect('/lander')
 
 @app.route('/lander', methods=['GET', 'POST'])
 def lander():
     if request.method == 'POST':
-        phrase = request.form.get('phrase')
-        if phrase == 'TheFans':
-            return redirect('/usrname')
-        elif phrase == 'sharktooth':
-            session['is_admin'] = True
+        phrase = request.form.get('phrase', '')
+        if phrase == 'sharktooth':
             return redirect('/admin')
-    return render_template_string("""
-        <form method="post">
-            <input name="phrase" placeholder="Secret Phrase">
-            <button type="submit">Enter</button>
-        </form>
-    """)
+        elif phrase == 'TheFans':
+            return redirect('/usrname')
+    return render_template_string(lander_page)
 
 @app.route('/usrname', methods=['GET', 'POST'])
 def usrname():
-    if shutdown_mode and not session.get('is_admin'):
-        return redirect('/lander')
     if request.method == 'POST':
-        session['username'] = request.form.get('username')
+        session['username'] = request.form['username']
         return redirect('/FriendGroup')
-    return render_template_string("""
-        <form method="post">
-            <input name="username" placeholder="Username">
-            <button type="submit">Enter Chat</button>
-        </form>
-    """)
+    return render_template_string(username_page)
 
 @app.route('/FriendGroup')
 def chat():
-    if shutdown_mode and not session.get('is_admin'):
-        return redirect('/lander')
-    ip = request.remote_addr
-    if ip in banned_ips:
-        return "You are banned."
-    return render_template_string("""
-        <div id="chat-box"></div>
-        <input id="msg"><button onclick="send()">Send</button>
-        <script src="//cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.0/socket.io.js"></script>
-        <script>
-        var socket = io();
-        socket.on('message', msg => {
-            let div = document.createElement('div');
-            div.textContent = msg;
-            document.getElementById('chat-box').appendChild(div);
-        });
-        function send() {
-            let msg = document.getElementById('msg').value;
-            socket.emit('message', msg);
-        }
-        </script>
-    """)
+    if shutdown or request.remote_addr in banned_ips:
+        return "Access Denied", 403
+    session['color'] = request.args.get('color', 'white')
+    return render_template_string(chat_page, username=session.get('username', 'Guest'))
 
-@app.route('/admin', methods=['GET', 'POST'])
-def admin():
-    if not session.get('is_admin'):
-        return redirect('/lander')
-    return render_template_string("""
-        <h1>Admin Panel</h1>
-        <form method="post" action="/admin/colorchat"><button>ColorChat</button></form>
-        <form method="post" action="/admin/ban"><input name="ip"><button>Ban hammer</button></form>
-        <form method="post" action="/admin/unban"><input name="ip"><button>Unbanner</button></form>
-        <form method="post" action="/admin/clearchat"><button>ClearChat</button></form>
-        <form method="post" action="/admin/shutdown"><button>Shutdown</button></form>
-        <form method="post" action="/admin/toggle"><button>Toggle Light/Dark Mode</button></form>
-    """)
+@app.route('/admin')
+def admin(): return render_template_string(admin_page)
 
-@app.route('/admin/<action>', methods=['POST'])
-def admin_action(action):
-    global chat_history, shutdown_mode, dark_mode
-    if not session.get('is_admin'):
-        return redirect('/lander')
-    if action == 'colorchat':
-        session['username'] = '<span style="color:red">' + session.get('username', 'Admin') + '</span>'
-        return redirect('/FriendGroup')
-    if action == 'ban':
-        banned_ips.add(request.form.get('ip'))
-    if action == 'unban':
-        banned_ips.discard(request.form.get('ip'))
-    if action == 'clearchat':
-        chat_history.clear()
-    if action == 'shutdown':
-        shutdown_mode = not shutdown_mode
-    if action == 'toggle':
-        dark_mode = not dark_mode
+@app.route('/admin/ban', methods=['POST'])
+def ban():
+    banned_ips.add(request.form['ip'])
     return redirect('/admin')
 
-@socketio.on('message')
-def handle_message(msg):
-    timestamp = datetime.now()
-    chat_history.append((session.get('username', 'Anonymous'), msg, timestamp))
-    socketio.emit('message', f"{session.get('username', 'Anonymous')}: {msg}")
+@app.route('/admin/unban', methods=['POST'])
+def unban():
+    banned_ips.discard(request.form['ip'])
+    return redirect('/admin')
+
+@app.route('/admin/clear', methods=['POST'])
+def clear_chat():
+    global chat_log
+    chat_log = []
+    return redirect('/admin')
+
+@app.route('/admin/shutdown', methods=['POST'])
+def shutdown_toggle():
+    global shutdown
+    shutdown = not shutdown
+    return redirect('/admin')
+
+@app.route('/admin/toggle', methods=['POST'])
+def toggle_mode():
+    global dark_mode
+    dark_mode = not dark_mode
+    return redirect('/admin')
+
+@app.route('/admin/sound', methods=['POST'])
+def play_sound():
+    file = request.files.get('sound')
+    if file and is_allowed(file.filename):
+        filename = secure_filename(file.filename)
+        path = os.path.join(UPLOAD_FOLDER, filename)
+        file.save(path)
+        socketio.emit('play_audio', f'/{path}')
+    return redirect('/admin')
+
+@socketio.on('join')
+def on_join(name):
+    print(f"{name} joined.")
+
+@socketio.on('chat')
+def on_chat(data):
+    now = datetime.utcnow()
+    # Remove expired messages
+    global chat_log
+    chat_log = [msg for msg in chat_log if now - msg['timestamp'] < timedelta(hours=10)]
+
+    message = {
+        'username': data['username'],
+        'text': data['text'],
+        'color': session.get('color', 'white'),
+        'timestamp': now
+    }
+    chat_log.append(message)
+    emit('message', message, broadcast=True)
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=8080)
+    socketio.run(app, host='0.0.0.0', port=5050)
