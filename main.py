@@ -1,210 +1,203 @@
-from flask import Flask, request, redirect, render_template_string, make_response, send_file
-import os
-import time
+# app.py
+from flask import Flask, request, render_template_string, redirect, session, url_for
+from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime, timedelta
-from collections import defaultdict
+import os, uuid
 
 app = Flask(__name__)
+app.secret_key = os.urandom(24)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///chatapp.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
 
-# Storage
-messages = []
-users = {}
-banned_ips = set()
-ban_messages = {}
-username_ip_map = {}
-broadcasts = []
-admin_only_mode = False
-dark_mode = False
+### ----- DATABASE MODELS ----- ###
+class Config(db.Model):
+    key = db.Column(db.String, primary_key=True)
+    value = db.Column(db.String)
 
-# Settings
-CHAT_EXPIRY_SECONDS = 36000  # 10 hours
+class User(db.Model):
+    username = db.Column(db.String, primary_key=True)
+    ip = db.Column(db.String)
+    is_admin = db.Column(db.Boolean, default=False)
+    color = db.Column(db.String, default="white")
 
-html_base = '''
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>{{ title }}</title>
-    <style>
-        body {
-            background-color: {% if dark %}#121212{% else %}#ffffff{% endif %};
-            color: {% if dark %}#ffffff{% else %}#000000{% endif %};
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            padding: 20px;
-        }
-        input[type="text"], input[type="file"] {
-            border-radius: 10px;
-            padding: 8px;
-            margin: 5px;
-            border: 1px solid #ccc;
-        }
-        button {
-            border-radius: 10px;
-            padding: 10px;
-            margin: 5px;
-            background-color: #4CAF50;
-            color: white;
-            border: none;
-            cursor: pointer;
-        }
-        button:hover {
-            background-color: #45a049;
-        }
-        .message {
-            margin-bottom: 10px;
-        }
-        .broadcast {
-            font-size: 18px;
-            font-weight: bold;
-            background-color: yellow;
-            color: black;
-            padding: 5px;
-            border-radius: 5px;
-        }
-        .admin {
-            font-weight: bold;
-            font-size: 18px;
-        }
-        .red {
-            color: red;
-        }
-    </style>
-</head>
-<body>
-<h1>{{ title }}</h1>
-{{ body }}
-</body>
-</html>
-'''
+class Message(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user = db.Column(db.String)
+    text = db.Column(db.String)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
 
-def current_time():
-    return time.time()
+class Ban(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    ip = db.Column(db.String, unique=True)
+    message = db.Column(db.String, default="You are banned.")
 
-def cleanup_expired():
-    cutoff = current_time() - CHAT_EXPIRY_SECONDS
-    global messages
-    messages = [m for m in messages if m['timestamp'] > cutoff]
+class Broadcast(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    text = db.Column(db.String)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+db.create_all()
+
+### ----- HELPERS ----- ###
+def get_config(key, default):
+    item = Config.query.get(key)
+    return item.value if item else default
+
+def set_config(key, value):
+    item = Config.query.get(key)
+    if not item:
+        item = Config(key=key, value=value)
+        db.session.add(item)
+    else:
+        item.value = value
+    db.session.commit()
+
+def expire_messages():
+    cutoff = datetime.utcnow() - timedelta(hours=10)
+    Message.query.filter(Message.timestamp < cutoff).delete()
+    db.session.commit()
+
+def current_user():
+    uname = session.get('username')
+    if not uname:
+        return None
+    return User.query.get(uname)
 
 def is_banned(ip):
-    return ip in banned_ips
+    return Ban.query.filter_by(ip=ip).first()
 
+### ----- ROUTES ----- ###
 @app.route('/')
-def index():
+def home():
     return redirect('/lander')
 
-@app.route('/lander', methods=['GET', 'POST'])
+@app.route('/lander', methods=['GET','POST'])
 def lander():
-    ip = request.remote_addr
-    if request.method == 'POST':
-        phrase = request.form.get('phrase')
-        if phrase == 'TheFans':
+    if get_config('shutdown', 'off') == 'on':
+        return "Site is currently disabled"
+    if request.method=='POST':
+        phrase = request.form['phrase']
+        if phrase == get_config('user_phrase', 'TheFans'):
             return redirect('/usrname')
-        elif phrase == 'sharktooth':
+        if phrase == get_config('admin_phrase', 'sharktooth'):
+            session['admin'] = True
             return redirect('/admin')
-    return render_template_string(html_base, title="Enter Secret Phrase", dark=dark_mode, body="""
-        <form method="POST">
-            <input type="text" name="phrase" placeholder="Secret Phrase">
-            <button type="submit">Enter</button>
+    return render_template_string(TPL_BASE, title="Enter Phrase", body="""
+        <form method='POST'>
+            <input name='phrase' placeholder='Secret Phrase'><br>
+            <button>Enter</button>
         </form>
     """)
 
-@app.route('/usrname', methods=['GET', 'POST'])
+@app.route('/usrname', methods=['GET','POST'])
 def usrname():
-    if request.method == 'POST':
-        uname = request.form.get('uname')
-        resp = make_response(redirect('/FriendGroup'))
-        resp.set_cookie('username', uname)
-        username_ip_map[uname] = request.remote_addr
-        return resp
-    return render_template_string(html_base, title="Choose Username", dark=dark_mode, body="""
-        <form method="POST">
-            <input type="text" name="uname" placeholder="Username">
-            <button type="submit">Join</button>
+    if request.method=='POST':
+        uname = request.form['username']
+        ip = request.remote_addr
+        user = User(username=uname, ip=ip, is_admin=False)
+        db.session.add(user); db.session.commit()
+        session['username'] = uname
+        return redirect('/chat')
+    return render_template_string(TPL_BASE, title="Choose Username", body="""
+        <form method='POST'>
+            <input name='username' placeholder='Username'><br>
+            <button>Join Chat</button>
         </form>
     """)
 
-@app.route('/FriendGroup', methods=['GET', 'POST'])
+@app.route('/chat', methods=['GET','POST'])
 def chat():
-    ip = request.remote_addr
-    if admin_only_mode and ip not in banned_ips and request.cookies.get('username') != 'admin':
+    if 'username' not in session:
         return redirect('/lander')
-    if is_banned(ip):
-        msg = ban_messages.get(ip, "You are banned.")
-        return render_template_string(html_base, title="Banned", dark=dark_mode, body=f"<p>{msg}</p>")
+    user = current_user()
+    if is_banned(user.ip):
+        return is_banned(user.ip).message
+    if request.method=='POST':
+        text = request.form['msg']
+        m = Message(user=user.username, text=text)
+        db.session.add(m); db.session.commit()
+    expire_messages()
+    msgs = Message.query.order_by(Message.timestamp).all()
+    bcasts = Broadcast.query.order_by(Broadcast.timestamp).all()
+    return render_template_string(TPL_BASE, title="Chat Room", body="""
+        {% for b in bcasts %}<div class='broadcast'>{{b.text}}</div>{% endfor %}
+        <form method='POST'><input name='msg' placeholder='Message'><button>Send</button></form>
+        {% for m in msgs %}
+            <div style="color: {{ 'red' if m.user==config('colorchat', '') else 'white' }};">
+                <b style="{{ 'font-weight:bold;font-size:1.2em;' if m.user==config('adminuser','') else '' }}">{{m.user}}:</b> {{m.text}}
+            </div>
+        {% endfor %}
+    """, msgs=msgs, bcasts=bcasts)
 
-    uname = request.cookies.get('username')
-    if not uname:
-        return redirect('/usrname')
-
-    if request.method == 'POST':
-        content = request.form.get('msg')
-        messages.append({'user': uname, 'msg': content, 'timestamp': current_time(), 'admin': uname=='admin'})
-    cleanup_expired()
-    all_msgs = '<br>'.join(
-        [f"<div class='message {'admin' if m['admin'] else ''}'><b class='{'admin' if m['admin'] else ''}'>{m['user']}:</b> {m['msg']}</div>" for m in messages] +
-        [f"<div class='broadcast'>{b}</div>" for b in broadcasts]
-    )
-    return render_template_string(html_base, title="Chat Room", dark=dark_mode, body=f"""
-        <form method="POST">
-            <input type="text" name="msg" placeholder="Your Message">
-            <button type="submit">Send</button>
-        </form>
-        <hr>
-        {all_msgs}
-    """)
-
-@app.route('/admin', methods=['GET', 'POST'])
+@app.route('/admin', methods=['GET','POST'])
 def admin():
-    global admin_only_mode, dark_mode
-    ip = request.remote_addr
-    if request.method == 'POST':
-        action = request.form.get('action')
-        uname = request.form.get('target')
-        msg = request.form.get('broadcast')
-        reason = request.form.get('reason')
+    if not session.get('admin'):
+        return redirect('/lander')
+    users = User.query.all()
+    bans = Ban.query.all()
+    phrases = {'user':get_config('user_phrase','TheFans'),'admin':get_config('admin_phrase','sharktooth')}
+    if request.method=='POST':
+        f = request.form
+        if f.get('set_user_phrase'):
+            set_config('user_phrase', f['user_phrase'])
+        if f.get('set_admin_phrase'):
+            set_config('admin_phrase', f['admin_phrase'])
+        if f.get('colorchat'):
+            set_config('colorchat', f['color_target'])
+        if f.get('broadcast'):
+            b = Broadcast(text=f['broadcast_msg'])
+            db.session.add(b); db.session.commit()
+        if f.get('ban'):
+            ip = User.query.get(f['ban_user']).ip
+            b = Ban(ip=ip,message=f['ban_msg'])
+            db.session.add(b); db.session.commit()
+        if f.get('unban'):
+            Ban.query.filter_by(ip=User.query.get(f['unban_user']).ip).delete(); db.session.commit()
+        if f.get('toggle_dark'):
+            set_config('theme', 'dark' if phrases.get('theme')!='dark' else 'light')
+        if f.get('shutdown_toggle'):
+            set_config('shutdown', 'off' if phrases.get('shutdown')=='on' else 'on')
+    return render_template_string(TPL_BASE, title="Admin Panel", body=render_template_string("""
+        <h3>Current Social Phrases</h3>
+        User: <input name='user_phrase' value='{{phrases.user}}'>
+        <button name='set_user_phrase'>Set</button><br>
+        Admin: <input name='admin_phrase' value='{{phrases.admin}}'>
+        <button name='set_admin_phrase'>Set</button><br><hr>
 
-        if action == 'ColorChat':
-            resp = make_response(redirect('/FriendGroup'))
-            resp.set_cookie('username', uname)
-            messages.append({'user': uname, 'msg': 'joined as admin.', 'timestamp': current_time(), 'admin': True})
-            return resp
-        elif action == 'Ban':
-            ip_to_ban = username_ip_map.get(uname)
-            if ip_to_ban:
-                banned_ips.add(ip_to_ban)
-                ban_messages[ip_to_ban] = reason or "Banned."
-        elif action == 'Unban':
-            ip_to_unban = username_ip_map.get(uname)
-            if ip_to_unban:
-                banned_ips.discard(ip_to_unban)
-                ban_messages.pop(ip_to_unban, None)
-        elif action == 'ClearChat':
-            messages.clear()
-        elif action == 'Shutdown':
-            admin_only_mode = not admin_only_mode
-        elif action == 'Toggle':
-            dark_mode = not dark_mode
-        elif action == 'Broadcast' and msg:
-            broadcasts.append(msg)
+        <h3>Ban / Unban User</h3>
+        <select name='ban_user'> {% for u in users %}<option>{{u.username}}</option>{% endfor %}</select>
+        <input name='ban_msg' placeholder='Custom ban message'>
+        <button name='ban'>Ban</button><br>
+        <select name='unban_user'> {% for u in users %}<option>{{u.username}}</option>{% endfor %}</select>
+        <button name='unban'>Unban</button><hr>
 
-    user_list = '<br>'.join(f"{u}: {ip}" for u, ip in username_ip_map.items())
-    return render_template_string(html_base, title="Admin Panel", dark=dark_mode, body=f"""
-        <form method="POST">
-            <input type="text" name="target" placeholder="Username">
-            <button name="action" value="ColorChat">ColorChat</button><br>
-            <input type="text" name="reason" placeholder="Ban Reason">
-            <button name="action" value="Ban">Ban hammer</button>
-            <button name="action" value="Unban">Unbanner</button><br>
-            <button name="action" value="ClearChat">ClearChat</button>
-            <button name="action" value="Shutdown">Shutdown</button>
-            <button name="action" value="Toggle">Toggle</button><br>
-            <input type="text" name="broadcast" placeholder="Broadcast Message">
-            <button name="action" value="Broadcast">Broadcast</button>
-        </form>
-        <hr>
-        <h3>Username-IP Map:</h3>
-        {user_list}
-    """)
+        <h3>ColorChat</h3>
+        <input name='color_target' placeholder='Username to Red'>
+        <button name='colorchat'>Set Red Chat</button><hr>
 
+        <h3>Broadcast Message</h3>
+        <input name='broadcast_msg' placeholder='Your message'>
+        <button name='broadcast'>Broadcast</button><hr>
+
+        <h3>Site Settings</h3>
+        <button name='toggle_dark'>Toggle Theme</button>
+        <button name='shutdown_toggle'>Toggle Shutdown Mode</button>
+    """, users=users, phrases=phrases))
+
+### ----- TEMPLATE BASE ----- ###
+TPL_BASE = """
+<!doctype html><html><head><style>
+body { font-family:'Segoe UI'; background:#121212; color:white; padding:20px; }
+input, select, button { border-radius:12px; padding:8px; margin:5px; border:none; }
+button { background:#4caf50; color:white; cursor:pointer; }
+.broadcast { font-size:18px; font-weight:bold; color:yellow; margin:5px 0; }
+</style><title>{{title}}</title></head><body>
+<h1>{{title}}</h1>
+{{body|safe}}
+</body></html>
+"""
+
+# Run
 if __name__ == '__main__':
     app.run(debug=True, port=5050)
