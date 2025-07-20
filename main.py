@@ -102,22 +102,22 @@ def usrname():
         session['username'] = uname
         return redirect('/chat')
 
-return render_template_string(TPL_BASE, title="Chat Room", body="""
-    {% for b in bcasts %}
-        <div class='broadcast'>{{ b.text }}</div>
-    {% endfor %}
-    <form method='POST'>
-        <input name='msg' placeholder='Message'>
-        <button>Send</button>
-    </form>
-    {% for m in msgs %}
-        <div style="color: {{ 'red' if m.user == config('colorchat', '') else 'white' }};">
-            <b style="{{ 'font-weight:bold;font-size:1.2em;' if m.user == config('adminuser', '') else '' }}">
-                {{ m.user }}:
-            </b> {{ m.text }}
-        </div>
-    {% endfor %}
-""", msgs=msgs, bcasts=bcasts, config=get_config)
+    return render_template_string(TPL_BASE, title="Chat Room", body="""
+        {% for b in bcasts %}
+            <div class='broadcast'>{{ b.text }}</div>
+        {% endfor %}
+        <form method='POST'>
+            <input name='msg' placeholder='Message'>
+            <button>Send</button>
+        </form>
+        {% for m in msgs %}
+            <div style="color: {{ 'red' if m.user == config('colorchat', '') else 'white' }};">
+                <b style="{{ 'font-weight:bold;font-size:1.2em;' if m.user == config('adminuser', '') else '' }}">
+                    {{ m.user }}:
+                </b> {{ m.text }}
+            </div>
+        {% endfor %}
+    """, msgs=msgs, bcasts=bcasts, config=get_config)
 
 
 
