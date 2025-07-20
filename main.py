@@ -228,4 +228,4 @@ button { background: #4caf50; color: white; cursor: pointer; }
 
 # ---------- RUN ----------
 if __name__ == '__main__':
-    app.run(debug=True, port=5050)
+    app.run(debug=True, host=0.0.0.0,port=8000)
